@@ -55,7 +55,8 @@ import argparse
 import mimetypes
 import os
 import sys
-from typing import Any, Dict
+import urllib.parse
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import requests
 
@@ -105,7 +106,9 @@ def login(session: requests.Session, email: str, password: str) -> None:
 
 def prepare_upload(
     session: requests.Session,
-    file_path: str,
+    filename: str,
+    size: int,
+    mime_type: str,
     description: str = "",
     private: bool = False,
     erotic: bool = False,
@@ -119,7 +122,9 @@ def prepare_upload(
 
     Args:
         session: Authenticated requests session.
-        file_path: Path to the file to upload.
+        filename: Name of the file to upload.
+        size: File size in bytes.
+        mime_type: MIME type of the file.
         description: Optional textual description.
         private: Mark the video as private so that it is hidden from the
             public listing (corresponds to the “Všechny soubory jsou
@@ -137,13 +142,6 @@ def prepare_upload(
         RuntimeError: If the prepare request does not return the expected
             JSON structure.
     """
-    # Determine file properties.
-    filename = os.path.basename(file_path)
-    size = os.path.getsize(file_path)
-    mime_type, _ = mimetypes.guess_type(file_path)
-    if not mime_type:
-        mime_type = "application/octet-stream"
-
     # Compose metadata.  Booleans are sent as lowercase strings to match
     # jQuery's behaviour on the original form.
     data = {
@@ -170,7 +168,10 @@ def prepare_upload(
 def upload_binary(
     session: requests.Session,
     metadata: Dict[str, Any],
-    file_path: str,
+    filename: str,
+    size: int,
+    mime_type: str,
+    file_iter_factory: Callable[[int], Iterable[bytes]],
     show_progress: bool = False,
 ) -> Dict[str, Any]:
     """Transfer the binary data to the external CDN.
@@ -185,7 +186,10 @@ def upload_binary(
         session: Authenticated requests session.
         metadata: Dictionary containing ``project``, ``nonce``, ``params``
             and ``signature`` from the preparation step.
-        file_path: Local path to the file being uploaded.
+        filename: Name of the file being uploaded.
+        size: File size in bytes.
+        mime_type: MIME type of the file.
+        file_iter_factory: Callable returning an iterator over file chunks.
 
     Returns:
         A dictionary parsed from the JSON response of the upload API.
@@ -194,11 +198,6 @@ def upload_binary(
         RuntimeError: If the upload fails or the server returns a non‑JSON
             response.
     """
-    filename = os.path.basename(file_path)
-    mime_type, _ = mimetypes.guess_type(file_path)
-    if not mime_type:
-        mime_type = "application/octet-stream"
-
     import threading
     import itertools
     import time
@@ -270,8 +269,7 @@ def upload_binary(
             sys.stderr.write("\n")
             sys.stderr.flush()
 
-    total_size = os.path.getsize(file_path)
-    reporter = ProgressReporter(total_size) if show_progress else None
+    reporter = ProgressReporter(size) if show_progress else None
     text_fields = {
         "response": "JSON",
         "project": metadata["project"],
@@ -303,20 +301,18 @@ def upload_binary(
             for key, value in text_fields.items():
                 yield _encode_field(key, value)
             yield file_header
-            with open(file_path, "rb") as fh:
-                while True:
-                    data_chunk = fh.read(self.chunk_size)
-                    if not data_chunk:
-                        break
-                    if reporter:
-                        reporter.update(len(data_chunk))
-                    yield data_chunk
+            for data_chunk in file_iter_factory(self.chunk_size):
+                if not data_chunk:
+                    continue
+                if reporter:
+                    reporter.update(len(data_chunk))
+                yield data_chunk
             yield b"\r\n"
             yield closing_boundary
 
         def __len__(self) -> int:
             length = sum(len(_encode_field(k, v)) for k, v in text_fields.items())
-            length += len(file_header) + total_size + len(b"\r\n")
+            length += len(file_header) + size + len(b"\r\n")
             length += len(closing_boundary)
             return length
 
@@ -341,6 +337,119 @@ def upload_binary(
         raise RuntimeError(f"Upload failed: {resp.text[:200]}") from exc
 
 
+def _split_content_type(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return value.split(";", 1)[0].strip() or None
+
+
+def _extract_filename(content_disposition: Optional[str]) -> Optional[str]:
+    if not content_disposition:
+        return None
+    parts = [part.strip() for part in content_disposition.split(";")]
+    for part in parts[1:]:
+        if part.startswith("filename*="):
+            value = part.split("=", 1)[1].strip()
+            if "''" in value:
+                value = value.split("''", 1)[1]
+                value = urllib.parse.unquote(value)
+            return value.strip('"') or None
+        if part.startswith("filename="):
+            value = part.split("=", 1)[1].strip()
+            return value.strip('"') or None
+    return None
+
+
+def _filename_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    name = os.path.basename(parsed.path)
+    return name or "download.bin"
+
+
+def _guess_mime_type(name: str, header_type: Optional[str]) -> str:
+    header = _split_content_type(header_type)
+    if header:
+        return header
+    mime_type, _ = mimetypes.guess_type(name)
+    return mime_type or "application/octet-stream"
+
+
+def _remote_head(
+    session: requests.Session,
+    url: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    headers = {"Accept-Encoding": "identity"}
+    resp = session.head(url, allow_redirects=True, headers=headers)
+    try:
+        if resp.status_code >= 400:
+            return None, None, None
+        return (
+            resp.headers.get("Content-Length"),
+            resp.headers.get("Content-Type"),
+            resp.headers.get("Content-Disposition"),
+        )
+    finally:
+        resp.close()
+
+
+def _remote_get_headers(
+    session: requests.Session,
+    url: str,
+) -> Tuple[str, Optional[str], Optional[str]]:
+    headers = {"Accept-Encoding": "identity"}
+    resp = session.get(url, allow_redirects=True, stream=True, headers=headers)
+    try:
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Failed to access remote file (status {resp.status_code}).")
+        return (
+            resp.headers.get("Content-Length"),
+            resp.headers.get("Content-Type"),
+            resp.headers.get("Content-Disposition"),
+        )
+    finally:
+        resp.close()
+
+
+def get_remote_file_info(
+    session: requests.Session,
+    url: str,
+    filename_override: Optional[str] = None,
+) -> Tuple[str, int, str]:
+    size_header, content_type, content_disp = _remote_head(session, url)
+    if not size_header:
+        size_header, content_type, content_disp = _remote_get_headers(session, url)
+    if not size_header:
+        raise RuntimeError("Remote file does not provide Content-Length.")
+    try:
+        size = int(size_header)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid Content-Length: {size_header}") from exc
+    filename = filename_override or _extract_filename(content_disp) or _filename_from_url(url)
+    mime_type = _guess_mime_type(filename, content_type)
+    return filename, size, mime_type
+
+
+def iter_local_file(file_path: str, chunk_size: int) -> Iterable[bytes]:
+    with open(file_path, "rb") as fh:
+        while True:
+            data_chunk = fh.read(chunk_size)
+            if not data_chunk:
+                break
+            yield data_chunk
+
+
+def iter_remote_file(session: requests.Session, url: str, chunk_size: int) -> Iterable[bytes]:
+    headers = {"Accept-Encoding": "identity"}
+    resp = session.get(url, allow_redirects=True, stream=True, headers=headers)
+    resp.raise_for_status()
+    try:
+        for data_chunk in resp.iter_content(chunk_size=chunk_size):
+            if data_chunk:
+                yield data_chunk
+    finally:
+        resp.close()
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Upload a file to Prehraj.to via the command line",
@@ -353,7 +462,19 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--email", required=True, help="Přehráj.to account email")
     parser.add_argument("--password", required=True, help="Přehráj.to account password")
-    parser.add_argument("--file", dest="file_path", required=True, help="Path to the file to upload")
+    file_group = parser.add_mutually_exclusive_group(required=True)
+    file_group.add_argument("--file", dest="file_path", help="Path to the file to upload")
+    file_group.add_argument(
+        "--remote-url",
+        dest="remote_url",
+        help="HTTP(S) URL of a remote file to stream-upload",
+    )
+    parser.add_argument(
+        "--remote-filename",
+        dest="remote_filename",
+        default=None,
+        help="Override the filename for remote uploads",
+    )
     parser.add_argument(
         "--description",
         default="",
@@ -386,22 +507,46 @@ def main(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
-    if not os.path.isfile(args.file_path):
+    if args.file_path and not os.path.isfile(args.file_path):
         print(f"The file '{args.file_path}' does not exist or is not a regular file.", file=sys.stderr)
         return 1
 
     session = requests.Session()
     try:
         login(session, args.email, args.password)
+        if args.file_path:
+            filename = os.path.basename(args.file_path)
+            size = os.path.getsize(args.file_path)
+            mime_type, _ = mimetypes.guess_type(args.file_path)
+            if not mime_type:
+                mime_type = "application/octet-stream"
+            file_iter_factory = lambda chunk_size: iter_local_file(args.file_path, chunk_size)
+        else:
+            filename, size, mime_type = get_remote_file_info(
+                session,
+                args.remote_url,
+                filename_override=args.remote_filename,
+            )
+            file_iter_factory = lambda chunk_size: iter_remote_file(session, args.remote_url, chunk_size)
         meta = prepare_upload(
             session,
-            args.file_path,
+            filename,
+            size,
+            mime_type,
             description=args.description,
             private=args.private,
             erotic=args.erotic,
             folder=args.folder,
         )
-        result = upload_binary(session, meta, args.file_path, show_progress=args.progress)
+        result = upload_binary(
+            session,
+            meta,
+            filename,
+            size,
+            mime_type,
+            file_iter_factory,
+            show_progress=args.progress,
+        )
         # Print the JSON response in a human‑readable format.
         import json as _json  # local import to avoid polluting global namespace
         print(_json.dumps(result, ensure_ascii=False, indent=2))
