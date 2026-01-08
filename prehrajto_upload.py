@@ -239,6 +239,16 @@ def upload_binary(
                 return 100
             return int((self.uploaded / self.total_size) * 100)
 
+        def _format_rate(self) -> str:
+            elapsed = max(0.001, time.monotonic() - self.start_time)
+            rate = self.uploaded / elapsed
+            units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"]
+            unit_index = 0
+            while rate >= 1024 and unit_index < len(units) - 1:
+                rate /= 1024
+                unit_index += 1
+            return f"{rate:.1f} {units[unit_index]}"
+
         def _maybe_switch_to_percent(self) -> None:
             if self.percent_mode:
                 return
@@ -253,7 +263,8 @@ def upload_binary(
             if not force and percent == self._last_percent:
                 return
             self._last_percent = percent
-            sys.stderr.write(f"\rUploading... {percent}%")
+            rate = self._format_rate()
+            sys.stderr.write(f"\rUploading... {percent}% ({rate})")
             sys.stderr.flush()
 
         def update(self, delta: int) -> None:
