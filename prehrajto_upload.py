@@ -511,11 +511,6 @@ def main(argv: list[str]) -> int:
         ),
     )
 
-    parser.add_argument(
-        "--progress",
-        action="store_true",
-        help="Display a simple upload progress indicator on stderr",
-    )
     args = parser.parse_args(argv)
 
     if args.file_path and not os.path.isfile(args.file_path):
@@ -556,7 +551,7 @@ def main(argv: list[str]) -> int:
             size,
             mime_type,
             file_iter_factory,
-            show_progress=args.progress,
+            show_progress=True,
         )
         # Print the JSON response in a human‑readable format.
         import json as _json  # local import to avoid polluting global namespace
